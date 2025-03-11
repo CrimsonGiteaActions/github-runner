@@ -14,6 +14,11 @@ namespace GitHub.DistributedTask.WebApi
         {
             ArgumentUtility.CheckStringForNullOrEmpty(version, "version");
 
+            int trim = version.IndexOf('+');
+            if (trim > 0)
+            {
+                version = version.Substring(0, trim);
+            }
             String[] segments = version.Split(new char[] { '.', '-' }, StringSplitOptions.None);
             if (segments.Length < 3 || segments.Length > 4)
             {
