@@ -26,15 +26,18 @@ namespace GitHub.Runner.Listener
         private TaskAgentStatus runnerStatus = TaskAgentStatus.Online;
         private CancellationTokenSource _getMessagesTokenSource;
         private VssCredentials _creds;
+        private VssCredentials _credsV2;
         private TaskAgentSession _session;
         private IRunnerServer _runnerServer;
         private IBrokerServer _brokerServer;
+        private ICredentialManager _credMgr;
         private readonly Dictionary<string, int> _sessionCreationExceptionTracker = new();
         private bool _accessTokenRevoked = false;
         private readonly TimeSpan _sessionCreationRetryInterval = TimeSpan.FromSeconds(30);
         private readonly TimeSpan _sessionConflictRetryLimit = TimeSpan.FromMinutes(4);
         private readonly TimeSpan _clockSkewRetryLimit = TimeSpan.FromMinutes(30);
-
+        private bool _needRefreshCredsV2 = false;
+        private bool _handlerInitialized = false;
 
         public override void Initialize(IHostContext hostContext)
         {
@@ -43,6 +46,7 @@ namespace GitHub.Runner.Listener
             _term = HostContext.GetService<ITerminal>();
             _runnerServer = HostContext.GetService<IRunnerServer>();
             _brokerServer = HostContext.GetService<IBrokerServer>();
+            _credMgr = HostContext.GetService<ICredentialManager>();
         }
 
         public async Task<CreateSessionResult> CreateSessionAsync(CancellationToken token)
@@ -63,8 +67,7 @@ namespace GitHub.Runner.Listener
 
             // Create connection.
             Trace.Info("Loading Credentials");
-            var credMgr = HostContext.GetService<ICredentialManager>();
-            _creds = credMgr.LoadCredentials();
+            _creds = _credMgr.LoadCredentials(allowAuthUrlV2: false);
 
             var agent = new TaskAgentReference
             {
@@ -87,7 +90,8 @@ namespace GitHub.Runner.Listener
                 try
                 {
                     Trace.Info("Connecting to the Broker Server...");
-                    await _brokerServer.ConnectAsync(new Uri(serverUrlV2), _creds);
+                    _credsV2 = _credMgr.LoadCredentials(allowAuthUrlV2: true);
+                    await _brokerServer.ConnectAsync(new Uri(serverUrlV2), _credsV2);
                     Trace.Info("VssConnection created");
 
                     if (!string.IsNullOrEmpty(serverUrl) &&
@@ -112,6 +116,13 @@ namespace GitHub.Runner.Listener
                         encounteringError = false;
                     }
 
+                    if (!_handlerInitialized)
+                    {
+                        // Register event handler for auth migration state change
+                        HostContext.AuthMigrationChanged += HandleAuthMigrationChanged;
+                        _handlerInitialized = true;
+                    }
+
                     return CreateSessionResult.Success;
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -130,7 +141,7 @@ namespace GitHub.Runner.Listener
                     Trace.Error("Catch exception during create session.");
                     Trace.Error(ex);
 
-                    if (ex is VssOAuthTokenRequestException vssOAuthEx && _creds.Federated is VssOAuthCredential vssOAuthCred)
+                    if (ex is VssOAuthTokenRequestException vssOAuthEx && _credsV2.Federated is VssOAuthCredential vssOAuthCred)
                     {
                         // "invalid_client" means the runner registration has been deleted from the server.
                         if (string.Equals(vssOAuthEx.Error, "invalid_client", StringComparison.OrdinalIgnoreCase))
@@ -161,6 +172,12 @@ namespace GitHub.Runner.Listener
                         return CreateSessionResult.Failure;
                     }
 
+                    if (HostContext.AllowAuthMigration)
+                    {
+                        Trace.Info("Disable migration mode for 60 minutes.");
+                        HostContext.DeferAuthMigration(TimeSpan.FromMinutes(60), $"Session creation failed with exception: {ex}");
+                    }
+
                     if (!encounteringError) //print the message only on the first error
                     {
                         _term.WriteError($"{DateTime.UtcNow:u}: Runner connect error: {ex.Message}. Retrying until reconnected.");
@@ -177,6 +194,11 @@ namespace GitHub.Runner.Listener
         {
             if (_session != null && _session.SessionId != Guid.Empty)
             {
+                if (_handlerInitialized)
+                {
+                    HostContext.AuthMigrationChanged -= HandleAuthMigrationChanged;
+                }
+
                 if (!_accessTokenRevoked)
                 {
                     using (var ts = new CancellationTokenSource(TimeSpan.FromSeconds(30)))
@@ -219,6 +241,13 @@ namespace GitHub.Runner.Listener
                 _getMessagesTokenSource = CancellationTokenSource.CreateLinkedTokenSource(token);
                 try
                 {
+                    if (_needRefreshCredsV2)
+                    {
+                        Trace.Info("Refreshing broker connection.");
+                        await RefreshBrokerConnectionAsync();
+                        _needRefreshCredsV2 = false;
+                    }
+
                     message = await _brokerServer.GetRunnerMessageAsync(_session.SessionId,
                                                                         runnerStatus,
                                                                         BuildConstants.RunnerPackage.Version,
@@ -247,6 +276,11 @@ namespace GitHub.Runner.Listener
                 catch (TaskAgentAccessTokenExpiredException)
                 {
                     Trace.Info("Runner OAuth token has been revoked. Unable to pull message.");
+                    throw;
+                }
+                catch (HostedRunnerDeprovisionedException)
+                {
+                    Trace.Info("Hosted runner has been deprovisioned.");
                     throw;
                 }
                 catch (AccessDeniedException e) when (e.ErrorCode == 1)
@@ -293,6 +327,12 @@ namespace GitHub.Runner.Listener
                             encounteringError = true;
                         }
 
+                        if (HostContext.AllowAuthMigration)
+                        {
+                            Trace.Info("Disable migration mode for 60 minutes.");
+                            HostContext.DeferAuthMigration(TimeSpan.FromMinutes(60), $"Get next message failed with exception: {ex}");
+                        }
+
                         // re-create VssConnection before next retry
                         await RefreshBrokerConnectionAsync();
 
@@ -324,7 +364,7 @@ namespace GitHub.Runner.Listener
             }
         }
 
-        public async Task RefreshListenerTokenAsync(CancellationToken cancellationToken)
+        public async Task RefreshListenerTokenAsync()
         {
             await RefreshBrokerConnectionAsync();
         }
@@ -427,17 +467,16 @@ namespace GitHub.Runner.Listener
 
         private async Task RefreshBrokerConnectionAsync()
         {
-            var configManager = HostContext.GetService<IConfigurationManager>();
-            _settings = configManager.LoadSettings();
+            Trace.Info("Reload credentials.");
+            _credsV2 = _credMgr.LoadCredentials(allowAuthUrlV2: true);
+            await _brokerServer.ConnectAsync(new Uri(_settings.ServerUrlV2), _credsV2);
+            Trace.Info("Connection to Broker Server recreated.");
+        }
 
-            if (string.IsNullOrEmpty(_settings.ServerUrlV2))
-            {
-                throw new InvalidOperationException("ServerUrlV2 is not set");
-            }
-
-            var credMgr = HostContext.GetService<ICredentialManager>();
-            VssCredentials creds = credMgr.LoadCredentials();
-            await _brokerServer.ConnectAsync(new Uri(_settings.ServerUrlV2), creds);
+        private void HandleAuthMigrationChanged(object sender, EventArgs e)
+        {
+            Trace.Info($"Auth migration changed. Current allow auth migration state: {HostContext.AllowAuthMigration}");
+            _needRefreshCredsV2 = true;
         }
     }
 }
